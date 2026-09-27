@@ -34,42 +34,62 @@ public static class R13Win32 {
 }
 '@
 
+function Get-WindowHandlesForProcess {
+    param([int]$ProcessId)
+    $handles = New-Object System.Collections.Generic.List[IntPtr]
+    $callback = [R13Win32+EnumWindowsProc]{
+        param([IntPtr]$windowHandle, [IntPtr]$state)
+        [uint32]$windowPid = 0
+        [void][R13Win32]::GetWindowThreadProcessId($windowHandle, [ref]$windowPid)
+        if ([int]$windowPid -eq $ProcessId) { $handles.Add($windowHandle) }
+        return $true
+    }
+    [void][R13Win32]::EnumWindows($callback, [IntPtr]::Zero)
+    return @($handles.ToArray())
+}
+
+function Convert-UiaElementToRecord {
+    param([System.Windows.Automation.AutomationElement]$Element)
+    try {
+        [object]$invokePattern = $null
+        [object]$valuePattern = $null
+        $hasInvokePattern = $Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)
+        $hasValuePattern = $Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)
+        return [ordered]@{
+            name = $Element.Current.Name
+            automationId = $Element.Current.AutomationId
+            controlType = $Element.Current.ControlType.ProgrammaticName
+            className = $Element.Current.ClassName
+            enabled = $Element.Current.IsEnabled
+            offscreen = $Element.Current.IsOffscreen
+            hasInvokePattern = [bool]$hasInvokePattern
+            hasValuePattern = [bool]$hasValuePattern
+        }
+    } catch {
+        return [ordered]@{ error = $_.Exception.Message }
+    }
+}
+
 function Get-UiaNodesForProcess {
     param([int]$ProcessId)
     $items = @()
-    try {
-        $condition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
-            $ProcessId
-        )
-        $found = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $condition
-        )
-        $limit = [Math]::Min($found.Count, 2000)
-        for ($i = 0; $i -lt $limit; $i++) {
-            $element = $found.Item($i)
-            try {
-                [object]$invokePattern = $null
-                [object]$valuePattern = $null
-                $hasInvokePattern = $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)
-                $hasValuePattern = $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)
-                $items += [ordered]@{
-                    name = $element.Current.Name
-                    automationId = $element.Current.AutomationId
-                    controlType = $element.Current.ControlType.ProgrammaticName
-                    className = $element.Current.ClassName
-                    enabled = $element.Current.IsEnabled
-                    offscreen = $element.Current.IsOffscreen
-                    hasInvokePattern = [bool]$hasInvokePattern
-                    hasValuePattern = [bool]$hasValuePattern
-                }
-            } catch {
-                $items += [ordered]@{ error = $_.Exception.Message }
+    foreach ($windowHandle in @(Get-WindowHandlesForProcess -ProcessId $ProcessId)) {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($windowHandle)
+            if ($null -eq $root) { continue }
+            $items += Convert-UiaElementToRecord -Element $root
+            $found = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition
+            )
+            $limit = [Math]::Min($found.Count, 2000)
+            for ($i = 0; $i -lt $limit; $i++) {
+                $element = $found.Item($i)
+                $items += Convert-UiaElementToRecord -Element $element
             }
+        } catch {
+            $items += [ordered]@{ error = $_.Exception.Message }
         }
-    } catch {
-        $items += [ordered]@{ error = $_.Exception.Message }
     }
     return @($items)
 }
@@ -81,24 +101,24 @@ function Find-ExactUiaElements {
     )
     $matches = @()
     foreach ($pidValue in $ProcessIds) {
-        try {
-            $pidCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty,
-                $pidValue
-            )
-            $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty,
-                $Name
-            )
-            $condition = [System.Windows.Automation.AndCondition]::new($pidCondition, $nameCondition)
-            $found = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $condition
-            )
-            foreach ($element in $found) {
-                $matches += $element
+        foreach ($windowHandle in @(Get-WindowHandlesForProcess -ProcessId $pidValue)) {
+            try {
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($windowHandle)
+                if ($null -eq $root) { continue }
+                if ($root.Current.Name -eq $Name) { $matches += $root }
+                $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::NameProperty,
+                    $Name
+                )
+                $found = $root.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $nameCondition
+                )
+                foreach ($element in $found) {
+                    $matches += $element
+                }
+            } catch {
             }
-        } catch {
         }
     }
     return @($matches)

@@ -292,9 +292,11 @@ function Invoke-MailTmRequest {
 function Get-MailTmMessages {
     param([string]$Bearer)
     $response = Invoke-MailTmRequest -Method GET -Path '/messages?page=1' -Bearer $Bearer
-    if ($response.status -ne 200) { throw 'mail listing status mismatch' }
-    if ($response.body -is [array]) { return @($response.body) }
-    if ($response.body -and $null -ne $response.body.'hydra:member') { return @($response.body.'hydra:member') }
+    if ($response['status'] -ne 200) { throw 'mail listing status mismatch' }
+    $responseBody = $response['body']
+    if ($responseBody -is [array]) { return @($responseBody) }
+    $hydraMemberProperty = if ($responseBody) { $responseBody.PSObject.Properties['hydra:member'] } else { $null }
+    if ($null -ne $hydraMemberProperty) { return @($hydraMemberProperty.Value) }
     throw 'mail listing shape mismatch'
 }
 
@@ -418,6 +420,7 @@ $result = [ordered]@{
         finalSnapshot = $null
         signedIn = $false
         errorClass = $null
+        errorReason = $null
     }
     exactNewTaskControl = [ordered]@{
         count = 0
@@ -534,9 +537,10 @@ try {
     if ($result.accountFlow.onboardingDetected -and $result.accountFlow.authorizedFixtureProvided) {
         try {
             $mailLogin = Invoke-MailTmRequest -Method POST -Path '/token' -Body @{ address = $OwnedEmail; password = $MailPassword }
-            $result.accountFlow.mailLoginStatus = $mailLogin.status
-            if ($mailLogin.status -ne 200 -or -not $mailLogin.body.token -or -not $mailLogin.body.id) { throw 'owned mail login failed' }
-            $mailToken = [string]$mailLogin.body.token
+            $result.accountFlow.mailLoginStatus = $mailLogin['status']
+            $mailLoginBody = $mailLogin['body']
+            if ($mailLogin['status'] -ne 200 -or -not $mailLoginBody.token -or -not $mailLoginBody.id) { throw 'owned mail login failed' }
+            $mailToken = [string]$mailLoginBody.token
             $baselineMessages = @(Get-MailTmMessages -Bearer $mailToken)
             $baselineIds = @($baselineMessages | ForEach-Object { [string]$_.id })
             $result.accountFlow.baselineMessageCount = $baselineMessages.Count
@@ -580,6 +584,8 @@ try {
             Write-Host 'R13_CHECKPOINT owned_final_snapshot_complete'
         } catch {
             $result.accountFlow.errorClass = $_.Exception.GetType().Name
+            $result.accountFlow.errorReason = $_.Exception.Message
+            Write-Host ('R13_CHECKPOINT owned_flow_error ' + $_.Exception.GetType().Name)
         }
     }
 

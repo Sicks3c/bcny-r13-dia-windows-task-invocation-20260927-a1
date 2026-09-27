@@ -339,11 +339,24 @@ function Get-DiaSnapshot {
     $interesting = @($nodes | Where-Object {
         $_.name -in @('New Task', 'Task', 'Message Dia…', 'Send', 'Stop response', 'Sign in', 'Continue')
     })
+    # Win32_Process/CIM can block indefinitely on hosted Windows runners. Keep
+    # snapshot collection deterministic and use the local Process API only;
+    # a matching live candidate is enough to gate the separate sealed pipe
+    # characterization run that captures parent/command-line/security state.
     $agentServerCandidates = @(
-        Get-CimInstance Win32_Process -Filter "Name='agent-server.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase)
-        } | ForEach-Object {
-            [ordered]@{ processId = [int]$_.ProcessId; parentProcessId = [int]$_.ParentProcessId; name = $_.Name; executablePath = $_.ExecutablePath; commandLine = $_.CommandLine }
+        Get-Process -Name 'agent-server' -ErrorAction SilentlyContinue | ForEach-Object {
+            $candidatePath = $null
+            try { $candidatePath = $_.Path } catch {}
+            if ($candidatePath -and $candidatePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase)) {
+                [ordered]@{
+                    processId = [int]$_.Id
+                    parentProcessId = $null
+                    name = $_.ProcessName
+                    executablePath = $candidatePath
+                    commandLine = $null
+                    collection = 'System.Diagnostics.Process (non-CIM)'
+                }
+            }
         }
     )
     return [ordered]@{

@@ -212,14 +212,56 @@ function Get-DiaProcesses {
     return @($matches)
 }
 
+function Invoke-UiaWorker {
+    param(
+        [ValidateSet('snapshot', 'invoke', 'submit')]
+        [string]$Mode,
+        [int[]]$ProcessIds,
+        [string]$Name,
+        [string]$ControlType,
+        [string]$ValueBase64,
+        [int]$TimeoutMilliseconds = 15000
+    )
+    if ($ProcessIds.Count -eq 0) {
+        return [ordered]@{ mode = $Mode; timedOut = $false; visibleWindowCount = 0; nodeCount = 0; nodes = @(); exactCount = 0; secondaryExactCount = 0; attempted = $false; succeeded = $false; error = $null }
+    }
+    $workerPath = Join-Path $PSScriptRoot 'uia-worker.ps1'
+    $workerOutput = Join-Path $env:RUNNER_TEMP ('r13-uia-worker-' + [Guid]::NewGuid().ToString('N') + '.json')
+    $arguments = @(
+        '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $workerPath),
+        '-Mode', $Mode,
+        '-ProcessIds', ('"{0}"' -f (($ProcessIds | Sort-Object -Unique) -join ',')),
+        '-OutputPath', ('"{0}"' -f $workerOutput)
+    )
+    if ($Name) { $arguments += @('-Name', ('"{0}"' -f $Name)) }
+    if ($ControlType) { $arguments += @('-ControlType', $ControlType) }
+    if ($ValueBase64) { $arguments += @('-ValueBase64', $ValueBase64) }
+    $workerProcess = $null
+    try {
+        $workerProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -PassThru
+        if (-not $workerProcess.WaitForExit($TimeoutMilliseconds)) {
+            try { $workerProcess.Kill() } catch {}
+            return [ordered]@{ mode = $Mode; timedOut = $true; visibleWindowCount = $null; nodeCount = 0; nodes = @(); exactCount = 0; secondaryExactCount = 0; attempted = $false; succeeded = $false; error = "UIA worker exceeded ${TimeoutMilliseconds}ms" }
+        }
+        if (-not (Test-Path -LiteralPath $workerOutput)) {
+            return [ordered]@{ mode = $Mode; timedOut = $false; visibleWindowCount = $null; nodeCount = 0; nodes = @(); exactCount = 0; secondaryExactCount = 0; attempted = $false; succeeded = $false; error = "UIA worker exited $($workerProcess.ExitCode) without output" }
+        }
+        $parsed = Get-Content -Raw -LiteralPath $workerOutput | ConvertFrom-Json
+        $parsed | Add-Member -NotePropertyName timedOut -NotePropertyValue $false
+        return $parsed
+    } finally {
+        if (Test-Path -LiteralPath $workerOutput) {
+            Remove-Item -LiteralPath $workerOutput -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-DiaSnapshot {
     param([string]$InstallLocation)
     $processes = @(Get-DiaProcesses -InstallLocation $InstallLocation)
     $processIds = @($processes | ForEach-Object { [int]$_.processId })
-    $nodes = @()
-    foreach ($pidValue in $processIds) {
-        $nodes += @(Get-UiaNodesForProcess -ProcessId $pidValue)
-    }
+    $uiaWorker = Invoke-UiaWorker -Mode snapshot -ProcessIds $processIds
+    $nodes = @($uiaWorker.nodes)
     $interesting = @($nodes | Where-Object {
         $_.name -in @('New Task', 'Task', 'Message Dia…', 'Send', 'Stop response', 'Sign in', 'Continue')
     })
@@ -228,6 +270,7 @@ function Get-DiaSnapshot {
         processes = @($processes)
         processCount = $processes.Count
         windows = @(Get-TopLevelWindows -ProcessIds $processIds)
+        uiaWorker = $uiaWorker
         uiaNodeCount = $nodes.Count
         uiaNodes = @($nodes)
         interestingUiaNodes = @($interesting)
@@ -258,6 +301,8 @@ $result = [ordered]@{
         exactButtonCount = 0
         invokeAttempted = $false
         markerObserved = $false
+        uiaSnapshotWorker = $null
+        uiaInvokeWorker = $null
         nodes = @()
     }
     normalActivation = $null
@@ -266,6 +311,7 @@ $result = [ordered]@{
         invokeAttempted = $false
         invokeSucceeded = $false
         reason = $null
+        uiaWorker = $null
     }
     afterNewTaskInvocation = $null
     externalActivation = [ordered]@{
@@ -345,19 +391,18 @@ try {
     ) -PassThru
     $result.positiveControl.processId = $positiveProcess.Id
     Start-Sleep -Seconds 3
-    $positiveNodes = @(Get-UiaNodesForProcess -ProcessId $positiveProcess.Id)
+    $positiveSnapshot = Invoke-UiaWorker -Mode snapshot -ProcessIds @($positiveProcess.Id)
+    $result.positiveControl.uiaSnapshotWorker = $positiveSnapshot
+    $positiveNodes = @($positiveSnapshot.nodes)
     $result.positiveControl.nodes = @($positiveNodes)
     $result.positiveControl.nodeCount = $positiveNodes.Count
-    $positiveButtons = @(Find-ExactUiaElements -ProcessIds @($positiveProcess.Id) -Name 'R13 Positive Control')
-    $result.positiveControl.exactButtonCount = $positiveButtons.Count
-    if ($positiveButtons.Count -eq 1) {
-        [object]$positiveInvoke = $null
-        if ($positiveButtons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$positiveInvoke)) {
-            $result.positiveControl.invokeAttempted = $true
-            ([System.Windows.Automation.InvokePattern]$positiveInvoke).Invoke()
-            Start-Sleep -Seconds 2
-            $result.positiveControl.markerObserved = Test-Path $positiveMarker
-        }
+    $positiveAction = Invoke-UiaWorker -Mode invoke -ProcessIds @($positiveProcess.Id) -Name 'R13 Positive Control' -ControlType 'Button'
+    $result.positiveControl.uiaInvokeWorker = $positiveAction
+    $result.positiveControl.exactButtonCount = $positiveAction.exactCount
+    $result.positiveControl.invokeAttempted = $positiveAction.attempted
+    if ($positiveAction.succeeded) {
+        Start-Sleep -Seconds 2
+        $result.positiveControl.markerObserved = Test-Path $positiveMarker
     }
 
     Start-Process -FilePath 'explorer.exe' -ArgumentList 'shell:AppsFolder\TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia' | Out-Null
@@ -365,49 +410,30 @@ try {
     $result.normalActivation = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
     $diaProcessIds = @($result.normalActivation.processes | ForEach-Object { [int]$_.processId })
-    $newTaskControls = @(Find-ExactUiaElements -ProcessIds $diaProcessIds -Name 'New Task' | Where-Object {
-        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
-        $_.Current.IsEnabled -and
-        -not $_.Current.IsOffscreen
-    })
-    $result.exactNewTaskControl.count = $newTaskControls.Count
-    if ($newTaskControls.Count -eq 1) {
-        [object]$invoke = $null
-        if ($newTaskControls[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-            $result.exactNewTaskControl.invokeAttempted = $true
-            ([System.Windows.Automation.InvokePattern]$invoke).Invoke()
-            $result.exactNewTaskControl.invokeSucceeded = $true
+    $newTaskAction = Invoke-UiaWorker -Mode invoke -ProcessIds $diaProcessIds -Name 'New Task' -ControlType 'Button'
+    $result.exactNewTaskControl.uiaWorker = $newTaskAction
+    $result.exactNewTaskControl.count = $newTaskAction.exactCount
+    $result.exactNewTaskControl.invokeAttempted = $newTaskAction.attempted
+    $result.exactNewTaskControl.invokeSucceeded = $newTaskAction.succeeded
+    if ($newTaskAction.exactCount -eq 1) {
+        if ($newTaskAction.succeeded) {
             Start-Sleep -Seconds 10
             $result.afterNewTaskInvocation = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
             $taskProcessIds = @($result.afterNewTaskInvocation.processes | ForEach-Object { [int]$_.processId })
-            $taskInputs = @(Find-ExactUiaElements -ProcessIds $taskProcessIds -Name 'Message Dia…' | Where-Object {
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and
-                $_.Current.IsEnabled -and
-                -not $_.Current.IsOffscreen
-            })
-            $taskSendButtons = @(Find-ExactUiaElements -ProcessIds $taskProcessIds -Name 'Send' | Where-Object {
-                $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
-                $_.Current.IsEnabled -and
-                -not $_.Current.IsOffscreen
-            })
-            $result.promptSubmission.exactInputCount = $taskInputs.Count
-            $result.promptSubmission.exactSendCount = $taskSendButtons.Count
-            if ($taskInputs.Count -eq 1 -and $taskSendButtons.Count -eq 1) {
-                [object]$valuePattern = $null
-                [object]$sendInvoke = $null
-                $hasValue = $taskInputs[0].TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)
-                $hasSendInvoke = $taskSendButtons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$sendInvoke)
-                if ($hasValue -and $hasSendInvoke -and -not ([System.Windows.Automation.ValuePattern]$valuePattern).Current.IsReadOnly) {
-                    $safeToken = 'R13_TASK_MARKER_' + [Guid]::NewGuid().ToString('N')
-                    $safeMarkerPath = Join-Path $env:RUNNER_TEMP ($safeToken + '.txt')
-                    $safePrompt = "Create a UTF-8 text file at $safeMarkerPath containing only $safeToken, then read that same file back and reply with its exact contents. Do not access any other file, network site, account, or user data."
+            $safeToken = 'R13_TASK_MARKER_' + [Guid]::NewGuid().ToString('N')
+            $safeMarkerPath = Join-Path $env:RUNNER_TEMP ($safeToken + '.txt')
+            $safePrompt = "Create a UTF-8 text file at $safeMarkerPath containing only $safeToken, then read that same file back and reply with its exact contents. Do not access any other file, network site, account, or user data."
+            $safePromptBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($safePrompt))
+            $submitAction = Invoke-UiaWorker -Mode submit -ProcessIds $taskProcessIds -ValueBase64 $safePromptBase64
+            $result.promptSubmission.uiaWorker = $submitAction
+            $result.promptSubmission.exactInputCount = $submitAction.exactCount
+            $result.promptSubmission.exactSendCount = $submitAction.secondaryExactCount
+            if ($submitAction.succeeded) {
                     $result.promptSubmission.marker = $safeToken
                     $result.promptSubmission.markerPath = $safeMarkerPath
-                    $result.promptSubmission.attempted = $true
-                    ([System.Windows.Automation.ValuePattern]$valuePattern).SetValue($safePrompt)
+                    $result.promptSubmission.attempted = $submitAction.attempted
                     $result.promptSubmission.valueSet = $true
-                    ([System.Windows.Automation.InvokePattern]$sendInvoke).Invoke()
                     $result.promptSubmission.sendInvoked = $true
                     Start-Sleep -Seconds 45
                     $result.promptSubmission.markerObserved = Test-Path -LiteralPath $safeMarkerPath
@@ -416,17 +442,14 @@ try {
                     }
                     $result.promptSubmission.responseSnapshot = Get-DiaSnapshot -InstallLocation $package.InstallLocation
                     $result.promptSubmission.reason = 'The exact unsigned composer was exposed after the exact New Task button and received one constrained local marker task.'
-                } else {
-                    $result.promptSubmission.reason = 'Exact named controls appeared, but the input/send patterns were not both writable and invokable.'
-                }
             } else {
-                $result.promptSubmission.reason = 'The exact supported New Task control did not yield one unambiguous writable composer and Send button.'
+                $result.promptSubmission.reason = if ($submitAction.timedOut) { 'The time-bounded UIA composer worker timed out; no prompt was entered.' } else { 'The exact supported New Task control did not yield one unambiguous writable composer and Send button.' }
             }
         } else {
-            $result.exactNewTaskControl.reason = 'The unique exact control did not expose InvokePattern.'
+            $result.exactNewTaskControl.reason = if ($newTaskAction.timedOut) { 'The time-bounded UIA action worker timed out.' } else { 'The unique exact control did not expose InvokePattern.' }
         }
-    } elseif ($newTaskControls.Count -eq 0) {
-        $result.exactNewTaskControl.reason = 'No exact enabled, on-screen UIA Button named New Task was exposed.'
+    } elseif ($newTaskAction.exactCount -eq 0) {
+        $result.exactNewTaskControl.reason = if ($newTaskAction.timedOut) { 'The time-bounded UIA action worker timed out before resolving an exact New Task control.' } else { 'No exact enabled, on-screen UIA Button named New Task was exposed.' }
     } else {
         $result.exactNewTaskControl.reason = 'More than one exact target was exposed; refusing ambiguous invocation.'
     }

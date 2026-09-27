@@ -436,7 +436,7 @@ try {
                 Remove-AppxPackage -Package $dependencyFullName -ErrorAction Stop
                 $result.cleanup.dependencyPackagesRemoved += $dependencyFullName
             } catch {
-                $result.errors += "Dependency cleanup $dependencyFullName: $($_.Exception.Message)"
+                $result.errors += "Dependency cleanup ${dependencyFullName}: $($_.Exception.Message)"
             }
         }
         $result.cleanup.residualDiaPackageCount = @(

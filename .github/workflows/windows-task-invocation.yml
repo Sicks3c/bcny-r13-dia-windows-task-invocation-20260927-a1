@@ -1,0 +1,66 @@
+name: windows-task-invocation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify exact signed packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-assets'
+          New-Item -ItemType Directory -Path $assetDir -Force | Out-Null
+          $diaPath = Join-Path $assetDir 'Dia.x64.msix'
+          $depPath = Join-Path $assetDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://releases.diabrowser.com/windows/release-candidate/8EE7CF18-AF4C-48AF-94B0-4B9300876DA5/0.28.0.380/Dia.x64.msix' -OutFile $diaPath
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://releases.diabrowser.com/windows/dependencies/x64/Microsoft.VCLibs.x64.14.00.Desktop.14.0.33728.0.appx' -OutFile $depPath
+          $diaHash = (Get-FileHash -Algorithm SHA256 $diaPath).Hash.ToLowerInvariant()
+          $depHash = (Get-FileHash -Algorithm SHA256 $depPath).Hash.ToLowerInvariant()
+          if ($diaHash -ne 'fd92a6dd178222bc687683a2353b540bd13d0ed42ff87b61124a09bd8be09407') { throw "Unexpected Dia hash: $diaHash" }
+          if ($depHash -ne '077a3d1a5d0622bd3004dca85f5e192d6e98ec79b83d4aa06766759ea6c09c3d') { throw "Unexpected dependency hash: $depHash" }
+
+      - name: Probe supported task invocation paths
+        shell: pwsh
+        run: |
+          $assetDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-assets'
+          $resultDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-results'
+          New-Item -ItemType Directory -Path $resultDir -Force | Out-Null
+          ./scripts/probe.ps1 `
+            -DiaMsix (Join-Path $assetDir 'Dia.x64.msix') `
+            -DependencyAppx (Join-Path $assetDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx') `
+            -OutputPath (Join-Path $resultDir 'runtime-result.json')
+
+      - name: Self-check runtime evidence
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-results'
+          $resultPath = Join-Path $resultDir 'runtime-result.json'
+          if (-not (Test-Path $resultPath)) { throw 'runtime-result.json is missing' }
+          $result = Get-Content -Raw $resultPath | ConvertFrom-Json
+          if ($result.package.expectedVersion -ne '0.28.0.380') { throw 'Version self-check failed' }
+          if (-not $result.package.hashesVerified) { throw 'Hash self-check failed' }
+          if (-not $result.cleanup.attempted) { throw 'Cleanup self-check failed' }
+          Get-FileHash -Algorithm SHA256 $resultPath | ForEach-Object {
+            "{0}  runtime-result.json" -f $_.Hash.ToLowerInvariant()
+          } | Set-Content -Encoding ascii (Join-Path $resultDir 'SHA256SUMS')
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r13-dia-windows-task-invocation
+          path: ${{ runner.temp }}/r13-dia-task-results/
+          if-no-files-found: error
+          retention-days: 30
+

@@ -291,9 +291,14 @@ function Invoke-MailTmRequest {
 
 function Get-MailTmMessages {
     param([string]$Bearer)
-    $response = Invoke-MailTmRequest -Method GET -Path '/messages?page=1' -Bearer $Bearer
-    if ($response['status'] -ne 200) { throw 'mail listing status mismatch' }
-    $responseBody = $response['body']
+    # Preserve JSON-LD keys directly. Nesting the parsed object inside the
+    # ordered response wrapper caused `hydra:member` to be adapted differently
+    # across the two PowerShell builds used by hosted Windows runners.
+    $responseBody = Invoke-RestMethod -Method GET -Uri 'https://api.mail.tm/messages?page=1' -Headers @{
+        Accept = 'application/json'
+        Authorization = "Bearer $Bearer"
+        'User-Agent' = 'bcny-r13-owned-ui/1'
+    } -TimeoutSec 30
     if ($responseBody -is [array]) { return @($responseBody) }
     if ($responseBody -is [System.Collections.IDictionary] -and $responseBody.Contains('hydra:member')) {
         return @($responseBody['hydra:member'])

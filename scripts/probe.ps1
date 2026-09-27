@@ -30,6 +30,8 @@ public static class R13Win32 {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] public static extern IntPtr GetMenu(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll")] public static extern IntPtr GetSubMenu(IntPtr menu, int position);
+    [DllImport("user32.dll")] public static extern uint GetMenuItemID(IntPtr menu, int position);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int maxCount, uint flags);
 }
 '@
@@ -60,6 +62,9 @@ function Convert-UiaElementToRecord {
             automationId = $Element.Current.AutomationId
             controlType = $Element.Current.ControlType.ProgrammaticName
             className = $Element.Current.ClassName
+            acceleratorKey = $Element.Current.AcceleratorKey
+            accessKey = $Element.Current.AccessKey
+            helpText = $Element.Current.HelpText
             enabled = $Element.Current.IsEnabled
             offscreen = $Element.Current.IsOffscreen
             hasInvokePattern = [bool]$hasInvokePattern
@@ -141,12 +146,14 @@ function Get-TopLevelWindows {
             $menu = [R13Win32]::GetMenu($windowHandle)
             $menuCount = if ($menu -eq [IntPtr]::Zero) { 0 } else { [R13Win32]::GetMenuItemCount($menu) }
             $menuItems = @()
+            $menuTree = @()
             if ($menuCount -gt 0) {
                 for ($index = 0; $index -lt $menuCount; $index++) {
                     $label = New-Object System.Text.StringBuilder 512
                     [void][R13Win32]::GetMenuString($menu, [uint32]$index, $label, $label.Capacity, 0x400)
                     $menuItems += $label.ToString()
                 }
+                $menuTree = @(Get-Win32MenuTree -Menu $menu -Depth 0)
             }
             $windows.Add([ordered]@{
                 handle = ('0x{0:x}' -f $windowHandle.ToInt64())
@@ -157,12 +164,36 @@ function Get-TopLevelWindows {
                 enabled = [R13Win32]::IsWindowEnabled($windowHandle)
                 menuCount = $menuCount
                 menuItems = @($menuItems)
+                menuTree = @($menuTree)
             })
         }
         return $true
     }
     [void][R13Win32]::EnumWindows($callback, [IntPtr]::Zero)
     return @($windows.ToArray())
+}
+
+function Get-Win32MenuTree {
+    param(
+        [IntPtr]$Menu,
+        [int]$Depth
+    )
+    if ($Menu -eq [IntPtr]::Zero -or $Depth -gt 8) { return @() }
+    $entries = @()
+    $count = [R13Win32]::GetMenuItemCount($Menu)
+    for ($position = 0; $position -lt $count; $position++) {
+        $label = New-Object System.Text.StringBuilder 512
+        [void][R13Win32]::GetMenuString($Menu, [uint32]$position, $label, $label.Capacity, 0x400)
+        $subMenu = [R13Win32]::GetSubMenu($Menu, $position)
+        $commandId = [R13Win32]::GetMenuItemID($Menu, $position)
+        $entries += [ordered]@{
+            position = $position
+            label = $label.ToString()
+            commandId = [uint64]$commandId
+            children = if ($subMenu -eq [IntPtr]::Zero) { @() } else { @(Get-Win32MenuTree -Menu $subMenu -Depth ($Depth + 1)) }
+        }
+    }
+    return @($entries)
 }
 
 function Get-DiaProcesses {

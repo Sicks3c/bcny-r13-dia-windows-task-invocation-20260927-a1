@@ -201,13 +201,16 @@ function Get-Win32MenuTree {
 function Get-DiaProcesses {
     param([string]$InstallLocation)
     $matches = @()
-    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='Dia.exe'" -ErrorAction SilentlyContinue)) {
-        if ($process.ExecutablePath -and $process.ExecutablePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase)) {
+    foreach ($process in @(Get-Process -Name 'Dia' -ErrorAction SilentlyContinue)) {
+        $processPath = $null
+        try { $processPath = $process.Path } catch {}
+        if ($processPath -and $processPath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase)) {
             $matches += [ordered]@{
-                processId = [int]$process.ProcessId
-                parentProcessId = [int]$process.ParentProcessId
-                executablePath = $process.ExecutablePath
-                commandLine = $process.CommandLine
+                processId = [int]$process.Id
+                parentProcessId = $null
+                executablePath = $processPath
+                commandLine = $null
+                collection = 'System.Diagnostics.Process (non-CIM)'
             }
         }
     }
@@ -490,6 +493,7 @@ try {
 
     Add-AppxPackage -Path $DiaMsix
     $diaInstalledByProbe = $true
+    Write-Host 'R13_CHECKPOINT package_installed'
     $package = Get-AppxPackage -Name 'TheBrowserCompany.Dia' -ErrorAction Stop |
         Sort-Object Version -Descending |
         Select-Object -First 1
@@ -518,10 +522,12 @@ try {
         Start-Sleep -Seconds 2
         $result.positiveControl.markerObserved = Test-Path $positiveMarker
     }
+    Write-Host 'R13_CHECKPOINT positive_control_complete'
 
     Start-Process -FilePath 'explorer.exe' -ArgumentList 'shell:AppsFolder\TheBrowserCompany.Dia_ttt1ap7aakyb4!Dia' | Out-Null
     Start-Sleep -Seconds 15
     $result.normalActivation = Get-DiaSnapshot -InstallLocation $package.InstallLocation
+    Write-Host 'R13_CHECKPOINT normal_snapshot_complete'
 
     $onboardingNodes = @($result.normalActivation.uiaNodes)
     $result.accountFlow.onboardingDetected = @($onboardingNodes | Where-Object { $_.name -eq "What's your work email?" }).Count -eq 1
@@ -544,11 +550,13 @@ try {
                 if (Test-Path -LiteralPath $emailValueFile) { Remove-Item -LiteralPath $emailValueFile -Force -ErrorAction SilentlyContinue }
             }
             if (-not $emailAction.succeeded) { throw 'owned email UI action failed' }
+            Write-Host 'R13_CHECKPOINT owned_email_action_complete'
             Start-Sleep -Seconds 8
             $result.accountFlow.afterEmail = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
             $ownedCode = Wait-OwnedDiaCode -Bearer $mailToken -ExpectedEmail $OwnedEmail -BaselineIds $baselineIds
             $result.accountFlow.newOwnedCodeObserved = $true
+            Write-Host 'R13_CHECKPOINT owned_code_received'
             $codeValueFile = Join-Path $env:RUNNER_TEMP ('r13-owned-code-' + [Guid]::NewGuid().ToString('N') + '.secret')
             try {
                 [IO.File]::WriteAllText($codeValueFile, $ownedCode, [Text.Encoding]::UTF8)
@@ -558,6 +566,7 @@ try {
                 if (Test-Path -LiteralPath $codeValueFile) { Remove-Item -LiteralPath $codeValueFile -Force -ErrorAction SilentlyContinue }
             }
             if (-not $codeAction.succeeded) { throw 'owned code UI action failed' }
+            Write-Host 'R13_CHECKPOINT owned_code_action_complete'
             Start-Sleep -Seconds 12
             $result.accountFlow.afterCode = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
@@ -568,6 +577,7 @@ try {
             $result.accountFlow.finalSnapshot = Get-DiaSnapshot -InstallLocation $package.InstallLocation
             $finalNodes = @($result.accountFlow.finalSnapshot.uiaNodes)
             $result.accountFlow.signedIn = @($finalNodes | Where-Object { $_.name -eq "What's your work email?" }).Count -eq 0
+            Write-Host 'R13_CHECKPOINT owned_final_snapshot_complete'
         } catch {
             $result.accountFlow.errorClass = $_.Exception.GetType().Name
         }
@@ -577,6 +587,7 @@ try {
 
     $diaProcessIds = @($activeSnapshot.processes | ForEach-Object { [int]$_.processId })
     $newTaskAction = Invoke-UiaWorker -Mode invoke -ProcessIds $diaProcessIds -Name 'New Task' -ControlType 'Button'
+    Write-Host 'R13_CHECKPOINT new_task_action_complete'
     $result.exactNewTaskControl.uiaWorker = $newTaskAction
     $result.exactNewTaskControl.count = $newTaskAction.exactCount
     $result.exactNewTaskControl.invokeAttempted = $newTaskAction.attempted
@@ -624,6 +635,7 @@ try {
     }
     Start-Sleep -Seconds 10
     $result.externalActivation.afterDirectDiaSnapshot = Get-DiaSnapshot -InstallLocation $package.InstallLocation
+    Write-Host 'R13_CHECKPOINT external_activation_snapshot_complete'
 
     if (-not $result.promptSubmission.attempted -and -not $result.exactNewTaskControl.invokeSucceeded) {
         $result.promptSubmission.reason = 'Unsigned task composer was not deterministically reachable through the exact supported invocation paths.'
@@ -683,4 +695,5 @@ try {
         $serializedResult = $serializedResult.Replace($encodedValue, '[REDACTED_BASE64]')
     }
     $serializedResult | Set-Content -Encoding utf8 -Path $OutputPath
+    Write-Host 'R13_CHECKPOINT result_written'
 }

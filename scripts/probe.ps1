@@ -266,9 +266,8 @@ function Get-DiaSnapshot {
         $_.name -in @('New Task', 'Task', 'Message Dia…', 'Send', 'Stop response', 'Sign in', 'Continue')
     })
     $agentServerCandidates = @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase) -and $_.Name -ne 'Dia.exe') -or
-            ($_.CommandLine -and $_.CommandLine -like '*agent-server-resources*')
+        Get-CimInstance Win32_Process -Filter "Name='agent-server.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase)
         } | ForEach-Object {
             [ordered]@{ processId = [int]$_.ProcessId; parentProcessId = [int]$_.ParentProcessId; name = $_.Name; executablePath = $_.ExecutablePath; commandLine = $_.CommandLine }
         }

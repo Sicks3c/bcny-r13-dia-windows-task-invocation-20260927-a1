@@ -4,29 +4,29 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'R13 UIA Positive Control'
-$form.StartPosition = 'CenterScreen'
-$form.Size = New-Object System.Drawing.Size(430, 180)
-$form.TopMost = $true
+$window = New-Object System.Windows.Window
+$window.Title = 'R13 UIA Positive Control'
+$window.WindowStartupLocation = 'CenterScreen'
+$window.Width = 430
+$window.Height = 180
+$window.Topmost = $true
 
-$button = New-Object System.Windows.Forms.Button
+$button = New-Object System.Windows.Controls.Button
 $button.Name = 'R13PositiveControlButton'
-$button.Text = 'R13 Positive Control'
-$button.Location = New-Object System.Drawing.Point(95, 50)
-$button.Size = New-Object System.Drawing.Size(220, 42)
+$button.Content = 'R13 Positive Control'
+$button.Width = 220
+$button.Height = 42
 $button.Add_Click({
     'invoked' | Set-Content -Encoding ascii -Path $MarkerPath
-    $form.Close()
+    $window.Close()
 })
-$form.Controls.Add($button)
+$window.Content = $button
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 180000
-$timer.Add_Tick({ $form.Close() })
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMinutes(3)
+$timer.Add_Tick({ $window.Close() })
 $timer.Start()
-[void]$form.ShowDialog()
-
+[void]$window.ShowDialog()

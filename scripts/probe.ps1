@@ -265,10 +265,19 @@ function Get-DiaSnapshot {
     $interesting = @($nodes | Where-Object {
         $_.name -in @('New Task', 'Task', 'Message Dia…', 'Send', 'Stop response', 'Sign in', 'Continue')
     })
+    $agentServerCandidates = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallLocation, [StringComparison]::OrdinalIgnoreCase) -and $_.Name -ne 'Dia.exe') -or
+            ($_.CommandLine -and $_.CommandLine -like '*agent-server-resources*')
+        } | ForEach-Object {
+            [ordered]@{ processId = [int]$_.ProcessId; parentProcessId = [int]$_.ParentProcessId; name = $_.Name; executablePath = $_.ExecutablePath; commandLine = $_.CommandLine }
+        }
+    )
     return [ordered]@{
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         processes = @($processes)
         processCount = $processes.Count
+        agentServerCandidates = @($agentServerCandidates)
         windows = @(Get-TopLevelWindows -ProcessIds $processIds)
         uiaWorker = $uiaWorker
         uiaNodeCount = $nodes.Count
@@ -336,6 +345,8 @@ $result = [ordered]@{
         markerContentsMatched = $false
         responseSnapshot = $null
         reason = 'No task prompt is entered unless an unsigned task composer is deterministically exposed after exact supported invocation.'
+        symmetricCleanupGate = $false
+        agentHasLocalFileTools = $false
     }
     errors = @()
     cleanup = [ordered]@{
@@ -420,30 +431,15 @@ try {
             Start-Sleep -Seconds 10
             $result.afterNewTaskInvocation = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
-            $taskProcessIds = @($result.afterNewTaskInvocation.processes | ForEach-Object { [int]$_.processId })
-            $safeToken = 'R13_TASK_MARKER_' + [Guid]::NewGuid().ToString('N')
-            $safeMarkerPath = Join-Path $env:RUNNER_TEMP ($safeToken + '.txt')
-            $safePrompt = "Create a UTF-8 text file at $safeMarkerPath containing only $safeToken, then read that same file back and reply with its exact contents. Do not access any other file, network site, account, or user data."
-            $safePromptBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($safePrompt))
-            $submitAction = Invoke-UiaWorker -Mode submit -ProcessIds $taskProcessIds -ValueBase64 $safePromptBase64
-            $result.promptSubmission.uiaWorker = $submitAction
-            $result.promptSubmission.exactInputCount = $submitAction.exactCount
-            $result.promptSubmission.exactSendCount = $submitAction.secondaryExactCount
-            if ($submitAction.succeeded) {
-                    $result.promptSubmission.marker = $safeToken
-                    $result.promptSubmission.markerPath = $safeMarkerPath
-                    $result.promptSubmission.attempted = $submitAction.attempted
-                    $result.promptSubmission.valueSet = $true
-                    $result.promptSubmission.sendInvoked = $true
-                    Start-Sleep -Seconds 45
-                    $result.promptSubmission.markerObserved = Test-Path -LiteralPath $safeMarkerPath
-                    if ($result.promptSubmission.markerObserved) {
-                        $result.promptSubmission.markerContentsMatched = ((Get-Content -Raw -LiteralPath $safeMarkerPath).Trim() -eq $safeToken)
-                    }
-                    $result.promptSubmission.responseSnapshot = Get-DiaSnapshot -InstallLocation $package.InstallLocation
-                    $result.promptSubmission.reason = 'The exact unsigned composer was exposed after the exact New Task button and received one constrained local marker task.'
+            $taskNodes = @($result.afterNewTaskInvocation.uiaNodes)
+            $taskInputs = @($taskNodes | Where-Object { $_.name -eq 'Message Dia…' -and $_.controlType -eq 'ControlType.Edit' -and $_.enabled -and -not $_.offscreen })
+            $taskSendButtons = @($taskNodes | Where-Object { $_.name -eq 'Send' -and $_.controlType -eq 'ControlType.Button' -and $_.enabled -and -not $_.offscreen })
+            $result.promptSubmission.exactInputCount = $taskInputs.Count
+            $result.promptSubmission.exactSendCount = $taskSendButtons.Count
+            if ($taskInputs.Count -eq 1 -and $taskSendButtons.Count -eq 1) {
+                $result.promptSubmission.reason = 'Exact unsigned composer and Send control were mapped, but no symmetric task deletion/cleanup path was recovered; no prompt was entered.'
             } else {
-                $result.promptSubmission.reason = if ($submitAction.timedOut) { 'The time-bounded UIA composer worker timed out; no prompt was entered.' } else { 'The exact supported New Task control did not yield one unambiguous writable composer and Send button.' }
+                $result.promptSubmission.reason = if ($result.afterNewTaskInvocation.uiaWorker.timedOut) { 'The time-bounded UIA composer map timed out; no prompt was entered.' } else { 'The exact supported New Task control did not yield one unambiguous writable composer and Send button.' }
             }
         } else {
             $result.exactNewTaskControl.reason = if ($newTaskAction.timedOut) { 'The time-bounded UIA action worker timed out.' } else { 'The unique exact control did not expose InvokePattern.' }
@@ -485,8 +481,10 @@ try {
         if ($result.package.installLocation) {
             foreach ($process in @(Get-DiaProcesses -InstallLocation $result.package.installLocation)) {
                 try {
-                    Stop-Process -Id $process.processId -Force -ErrorAction Stop
-                    $result.cleanup.diaProcessesStopped += [int]$process.processId
+                    if (Get-Process -Id $process.processId -ErrorAction SilentlyContinue) {
+                        Stop-Process -Id $process.processId -Force -ErrorAction Stop
+                        $result.cleanup.diaProcessesStopped += [int]$process.processId
+                    }
                 } catch {
                     $result.errors += "Dia process cleanup: $($_.Exception.Message)"
                 }

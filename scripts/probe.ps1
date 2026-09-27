@@ -295,6 +295,9 @@ function Get-MailTmMessages {
     if ($response['status'] -ne 200) { throw 'mail listing status mismatch' }
     $responseBody = $response['body']
     if ($responseBody -is [array]) { return @($responseBody) }
+    if ($responseBody -is [System.Collections.IDictionary] -and $responseBody.Contains('hydra:member')) {
+        return @($responseBody['hydra:member'])
+    }
     $hydraMemberProperty = if ($responseBody) { $responseBody.PSObject.Properties['hydra:member'] } else { $null }
     if ($null -ne $hydraMemberProperty) { return @($hydraMemberProperty.Value) }
     throw 'mail listing shape mismatch'

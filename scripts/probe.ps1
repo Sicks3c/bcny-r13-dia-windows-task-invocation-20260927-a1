@@ -142,7 +142,7 @@ function Get-TopLevelWindows {
         return $true
     }
     [void][R13Win32]::EnumWindows($callback, [IntPtr]::Zero)
-    return @($windows)
+    return @($windows.ToArray())
 }
 
 function Get-DiaProcesses {

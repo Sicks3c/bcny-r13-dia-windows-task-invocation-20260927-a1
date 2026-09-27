@@ -51,6 +51,10 @@ jobs:
           if ($result.package.expectedVersion -ne '0.28.0.380') { throw 'Version self-check failed' }
           if (-not $result.package.hashesVerified) { throw 'Hash self-check failed' }
           if (-not $result.cleanup.attempted) { throw 'Cleanup self-check failed' }
+          if ($result.errors.Count -ne 0) { throw "Probe recorded errors: $($result.errors -join '; ')" }
+          if ($null -eq $result.normalActivation) { throw 'Normal activation snapshot is missing' }
+          if (-not $result.positiveControl.markerObserved) { throw 'UIA positive-control invocation failed' }
+          if ($result.cleanup.residualDiaPackageCount -ne 0) { throw 'Residual Dia package detected' }
           Get-FileHash -Algorithm SHA256 $resultPath | ForEach-Object {
             "{0}  runtime-result.json" -f $_.Hash.ToLowerInvariant()
           } | Set-Content -Encoding ascii (Join-Path $resultDir 'SHA256SUMS')
@@ -63,4 +67,3 @@ jobs:
           path: ${{ runner.temp }}/r13-dia-task-results/
           if-no-files-found: error
           retention-days: 30
-

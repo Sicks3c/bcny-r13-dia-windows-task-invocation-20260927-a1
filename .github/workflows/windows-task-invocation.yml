@@ -30,6 +30,9 @@ jobs:
 
       - name: Probe supported task invocation paths
         shell: pwsh
+        env:
+          R13_OWNED_EMAIL: ${{ secrets.R13_OWNED_EMAIL }}
+          R13_MAIL_PASSWORD: ${{ secrets.R13_MAIL_PASSWORD }}
         run: |
           $assetDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-assets'
           $resultDir = Join-Path $env:RUNNER_TEMP 'r13-dia-task-results'
@@ -37,7 +40,9 @@ jobs:
           ./scripts/probe.ps1 `
             -DiaMsix (Join-Path $assetDir 'Dia.x64.msix') `
             -DependencyAppx (Join-Path $assetDir 'Microsoft.VCLibs.x64.14.00.Desktop.appx') `
-            -OutputPath (Join-Path $resultDir 'runtime-result.json')
+            -OutputPath (Join-Path $resultDir 'runtime-result.json') `
+            -OwnedEmail $env:R13_OWNED_EMAIL `
+            -MailPassword $env:R13_MAIL_PASSWORD
 
       - name: Self-check runtime evidence
         if: always()

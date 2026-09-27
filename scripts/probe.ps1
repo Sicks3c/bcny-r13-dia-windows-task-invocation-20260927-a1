@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$DependencyAppx,
     [Parameter(Mandatory = $true)]
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string]$OwnedEmail,
+    [string]$MailPassword
 )
 
 $ErrorActionPreference = 'Stop'
@@ -214,12 +216,13 @@ function Get-DiaProcesses {
 
 function Invoke-UiaWorker {
     param(
-        [ValidateSet('snapshot', 'invoke', 'submit')]
+        [ValidateSet('snapshot', 'invoke', 'invokeText', 'submit', 'onboard', 'code')]
         [string]$Mode,
         [int[]]$ProcessIds,
         [string]$Name,
         [string]$ControlType,
         [string]$ValueBase64,
+        [string]$ValueFile,
         [int]$TimeoutMilliseconds = 15000
     )
     if ($ProcessIds.Count -eq 0) {
@@ -236,6 +239,7 @@ function Invoke-UiaWorker {
     if ($Name) { $arguments += @('-Name', ('"{0}"' -f $Name)) }
     if ($ControlType) { $arguments += @('-ControlType', $ControlType) }
     if ($ValueBase64) { $arguments += @('-ValueBase64', $ValueBase64) }
+    if ($ValueFile) { $arguments += @('-ValueFile', ('"{0}"' -f $ValueFile)) }
     $workerProcess = $null
     try {
         $workerProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -PassThru
@@ -254,6 +258,76 @@ function Invoke-UiaWorker {
             Remove-Item -LiteralPath $workerOutput -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Invoke-MailTmRequest {
+    param(
+        [string]$Method,
+        [string]$Path,
+        [hashtable]$Body,
+        [string]$Bearer
+    )
+    $headers = @{ Accept = 'application/json'; 'User-Agent' = 'bcny-r13-owned-ui/1' }
+    if ($Bearer) { $headers.Authorization = "Bearer $Bearer" }
+    $parameters = @{
+        Method = $Method
+        Uri = "https://api.mail.tm$Path"
+        Headers = $headers
+        UseBasicParsing = $true
+        SkipHttpErrorCheck = $true
+        TimeoutSec = 30
+    }
+    if ($Body) {
+        $parameters.ContentType = 'application/json'
+        $parameters.Body = ($Body | ConvertTo-Json -Compress)
+    }
+    $response = Invoke-WebRequest @parameters
+    $parsed = if ($response.Content) { $response.Content | ConvertFrom-Json } else { $null }
+    return [ordered]@{ status = [int]$response.StatusCode; body = $parsed }
+}
+
+function Get-MailTmMessages {
+    param([string]$Bearer)
+    $response = Invoke-MailTmRequest -Method GET -Path '/messages?page=1' -Bearer $Bearer
+    if ($response.status -ne 200) { throw 'mail listing status mismatch' }
+    if ($response.body -is [array]) { return @($response.body) }
+    if ($response.body -and $null -ne $response.body.'hydra:member') { return @($response.body.'hydra:member') }
+    throw 'mail listing shape mismatch'
+}
+
+function Wait-OwnedDiaCode {
+    param(
+        [string]$Bearer,
+        [string]$ExpectedEmail,
+        [string[]]$BaselineIds
+    )
+    $selected = @()
+    for ($attempt = 1; $attempt -le 12; $attempt++) {
+        $messages = @(Get-MailTmMessages -Bearer $Bearer)
+        $selected = @($messages | Where-Object {
+            $_.subject -eq 'Your Dia Code' -and $_.id -and $_.id -notin $BaselineIds
+        })
+        if ($selected.Count -gt 1) { throw 'multiple new Dia code messages' }
+        if ($selected.Count -eq 1) { break }
+        if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
+    }
+    if ($selected.Count -ne 1) { throw 'bounded Dia code poll exhausted' }
+    $messageId = [Uri]::EscapeDataString([string]$selected[0].id)
+    $detailResponse = Invoke-MailTmRequest -Method GET -Path "/messages/$messageId" -Bearer $Bearer
+    if ($detailResponse.status -ne 200 -or -not $detailResponse.body) { throw 'Dia code detail mismatch' }
+    $detail = $detailResponse.body
+    $recipientMatches = @($detail.to | Where-Object { $_.address -eq $ExpectedEmail })
+    if ($detail.subject -ne 'Your Dia Code' -or $recipientMatches.Count -ne 1) { throw 'Dia code ownership mismatch' }
+    $chunks = @()
+    foreach ($value in @($detail.text, $detail.intro)) { if ($value -is [string]) { $chunks += $value } }
+    foreach ($html in @($detail.html)) {
+        if ($html -isnot [string]) { continue }
+        $visible = $html -replace '(?is)<script\b.*?</script>', ' ' -replace '(?is)<style\b.*?</style>', ' ' -replace '(?s)<[^>]+>', ' '
+        $chunks += [Net.WebUtility]::HtmlDecode($visible)
+    }
+    $codes = @([regex]::Matches(($chunks -join "`n"), '(?<!\d)\d{6}(?!\d)') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+    if ($codes.Count -ne 1) { throw 'Dia code cardinality mismatch' }
+    return [string]$codes[0]
 }
 
 function Get-DiaSnapshot {
@@ -314,6 +388,21 @@ $result = [ordered]@{
         nodes = @()
     }
     normalActivation = $null
+    accountFlow = [ordered]@{
+        authorizedFixtureProvided = [bool]($OwnedEmail -and $MailPassword)
+        onboardingDetected = $false
+        mailLoginStatus = $null
+        baselineMessageCount = $null
+        emailEntry = $null
+        afterEmail = $null
+        newOwnedCodeObserved = $false
+        codeEntry = $null
+        afterCode = $null
+        acceptAction = $null
+        finalSnapshot = $null
+        signedIn = $false
+        errorClass = $null
+    }
     exactNewTaskControl = [ordered]@{
         count = 0
         invokeAttempted = $false
@@ -361,6 +450,8 @@ $result = [ordered]@{
 $diaInstalledByProbe = $false
 $newDependencyFullNames = @()
 $positiveProcess = $null
+$mailToken = $null
+$ownedCode = $null
 
 try {
     $result.package.hashesVerified = (
@@ -419,7 +510,59 @@ try {
     Start-Sleep -Seconds 15
     $result.normalActivation = Get-DiaSnapshot -InstallLocation $package.InstallLocation
 
-    $diaProcessIds = @($result.normalActivation.processes | ForEach-Object { [int]$_.processId })
+    $onboardingNodes = @($result.normalActivation.uiaNodes)
+    $result.accountFlow.onboardingDetected = @($onboardingNodes | Where-Object { $_.name -eq "What's your work email?" }).Count -eq 1
+    if ($result.accountFlow.onboardingDetected -and $result.accountFlow.authorizedFixtureProvided) {
+        try {
+            $mailLogin = Invoke-MailTmRequest -Method POST -Path '/token' -Body @{ address = $OwnedEmail; password = $MailPassword }
+            $result.accountFlow.mailLoginStatus = $mailLogin.status
+            if ($mailLogin.status -ne 200 -or -not $mailLogin.body.token -or -not $mailLogin.body.id) { throw 'owned mail login failed' }
+            $mailToken = [string]$mailLogin.body.token
+            $baselineMessages = @(Get-MailTmMessages -Bearer $mailToken)
+            $baselineIds = @($baselineMessages | ForEach-Object { [string]$_.id })
+            $result.accountFlow.baselineMessageCount = $baselineMessages.Count
+
+            $emailValueFile = Join-Path $env:RUNNER_TEMP ('r13-owned-email-' + [Guid]::NewGuid().ToString('N') + '.secret')
+            try {
+                [IO.File]::WriteAllText($emailValueFile, $OwnedEmail, [Text.Encoding]::UTF8)
+                $emailAction = Invoke-UiaWorker -Mode onboard -ProcessIds @($result.normalActivation.processes | ForEach-Object { [int]$_.processId }) -ValueFile $emailValueFile -TimeoutMilliseconds 25000
+                $result.accountFlow.emailEntry = $emailAction
+            } finally {
+                if (Test-Path -LiteralPath $emailValueFile) { Remove-Item -LiteralPath $emailValueFile -Force -ErrorAction SilentlyContinue }
+            }
+            if (-not $emailAction.succeeded) { throw 'owned email UI action failed' }
+            Start-Sleep -Seconds 8
+            $result.accountFlow.afterEmail = Get-DiaSnapshot -InstallLocation $package.InstallLocation
+
+            $ownedCode = Wait-OwnedDiaCode -Bearer $mailToken -ExpectedEmail $OwnedEmail -BaselineIds $baselineIds
+            $result.accountFlow.newOwnedCodeObserved = $true
+            $codeValueFile = Join-Path $env:RUNNER_TEMP ('r13-owned-code-' + [Guid]::NewGuid().ToString('N') + '.secret')
+            try {
+                [IO.File]::WriteAllText($codeValueFile, $ownedCode, [Text.Encoding]::UTF8)
+                $codeAction = Invoke-UiaWorker -Mode code -ProcessIds @($result.accountFlow.afterEmail.processes | ForEach-Object { [int]$_.processId }) -ValueFile $codeValueFile -TimeoutMilliseconds 25000
+                $result.accountFlow.codeEntry = $codeAction
+            } finally {
+                if (Test-Path -LiteralPath $codeValueFile) { Remove-Item -LiteralPath $codeValueFile -Force -ErrorAction SilentlyContinue }
+            }
+            if (-not $codeAction.succeeded) { throw 'owned code UI action failed' }
+            Start-Sleep -Seconds 12
+            $result.accountFlow.afterCode = Get-DiaSnapshot -InstallLocation $package.InstallLocation
+
+            $postCodeIds = @($result.accountFlow.afterCode.processes | ForEach-Object { [int]$_.processId })
+            $acceptAction = Invoke-UiaWorker -Mode invokeText -ProcessIds $postCodeIds -Name 'Accept' -ControlType 'Button'
+            $result.accountFlow.acceptAction = $acceptAction
+            if ($acceptAction.exactCount -eq 1 -and $acceptAction.succeeded) { Start-Sleep -Seconds 12 }
+            $result.accountFlow.finalSnapshot = Get-DiaSnapshot -InstallLocation $package.InstallLocation
+            $finalNodes = @($result.accountFlow.finalSnapshot.uiaNodes)
+            $result.accountFlow.signedIn = @($finalNodes | Where-Object { $_.name -eq "What's your work email?" }).Count -eq 0
+        } catch {
+            $result.accountFlow.errorClass = $_.Exception.GetType().Name
+        }
+    }
+
+    $activeSnapshot = if ($result.accountFlow.finalSnapshot) { $result.accountFlow.finalSnapshot } elseif ($result.accountFlow.afterCode) { $result.accountFlow.afterCode } elseif ($result.accountFlow.afterEmail) { $result.accountFlow.afterEmail } else { $result.normalActivation }
+
+    $diaProcessIds = @($activeSnapshot.processes | ForEach-Object { [int]$_.processId })
     $newTaskAction = Invoke-UiaWorker -Mode invoke -ProcessIds $diaProcessIds -Name 'New Task' -ControlType 'Button'
     $result.exactNewTaskControl.uiaWorker = $newTaskAction
     $result.exactNewTaskControl.count = $newTaskAction.exactCount
@@ -519,5 +662,12 @@ try {
     $result.finishedUtc = [DateTime]::UtcNow.ToString('o')
     $outputDirectory = Split-Path -Parent $OutputPath
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    $result | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8 -Path $OutputPath
+    $serializedResult = $result | ConvertTo-Json -Depth 12
+    $redactionValues = @($OwnedEmail, $MailPassword, $mailToken, $ownedCode) | Where-Object { $_ }
+    foreach ($secretValue in $redactionValues) {
+        $serializedResult = $serializedResult.Replace([string]$secretValue, '[REDACTED]')
+        $encodedValue = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$secretValue))
+        $serializedResult = $serializedResult.Replace($encodedValue, '[REDACTED_BASE64]')
+    }
+    $serializedResult | Set-Content -Encoding utf8 -Path $OutputPath
 }

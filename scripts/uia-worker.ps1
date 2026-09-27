@@ -1,12 +1,13 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('snapshot', 'invoke', 'submit')]
+    [ValidateSet('snapshot', 'invoke', 'invokeText', 'submit', 'onboard', 'code')]
     [string]$Mode,
     [Parameter(Mandatory = $true)]
     [string]$ProcessIds,
     [string]$Name,
     [string]$ControlType,
     [string]$ValueBase64,
+    [string]$ValueFile,
     [Parameter(Mandatory = $true)]
     [string]$OutputPath
 )
@@ -96,6 +97,36 @@ function Select-ExactElements {
     })
 }
 
+function Select-ButtonsContainingText {
+    param(
+        [object[]]$Elements,
+        [string[]]$Labels
+    )
+    $matches = @()
+    foreach ($element in $Elements) {
+        if ($element.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or
+            -not $element.Current.IsEnabled -or $element.Current.IsOffscreen) { continue }
+        foreach ($label in $Labels) {
+            $condition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                $label
+            )
+            if ($element.Current.Name -eq $label -or $null -ne $element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)) {
+                $matches += $element
+                break
+            }
+        }
+    }
+    return @($matches)
+}
+
+function Read-PrivateValue {
+    if (-not $ValueFile -or -not (Test-Path -LiteralPath $ValueFile)) { throw 'Private UI value file is missing' }
+    $value = (Get-Content -Raw -LiteralPath $ValueFile).Trim()
+    if (-not $value -or $value.Contains("`n") -or $value.Contains("`r")) { throw 'Private UI value is invalid' }
+    return $value
+}
+
 $result = [ordered]@{
     mode = $Mode
     processIds = @($pidSet.Keys | Sort-Object)
@@ -129,7 +160,18 @@ try {
                 $result.succeeded = $true
             }
         }
-    } else {
+    } elseif ($Mode -eq 'invokeText') {
+        $matches = @(Select-ButtonsContainingText -Elements $elements -Labels @($Name))
+        $result.exactCount = $matches.Count
+        if ($matches.Count -eq 1) {
+            [object]$invoke = $null
+            if ($matches[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                $result.attempted = $true
+                ([System.Windows.Automation.InvokePattern]$invoke).Invoke()
+                $result.succeeded = $true
+            }
+        }
+    } elseif ($Mode -eq 'submit') {
         $inputMatches = @(Select-ExactElements -Elements $elements -ExactName 'Message Dia…' -ExactControlType 'Edit')
         $sendMatches = @(Select-ExactElements -Elements $elements -ExactName 'Send' -ExactControlType 'Button')
         $result.exactCount = $inputMatches.Count
@@ -147,10 +189,64 @@ try {
                 $result.succeeded = $true
             }
         }
+    } elseif ($Mode -eq 'onboard') {
+        $email = Read-PrivateValue
+        $inputs = @(Select-ExactElements -Elements $elements -ExactName 'Work email' -ExactControlType 'Edit')
+        $result.exactCount = $inputs.Count
+        if ($inputs.Count -eq 1) {
+            [object]$value = $null
+            if ($inputs[0].TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value) -and
+                -not ([System.Windows.Automation.ValuePattern]$value).Current.IsReadOnly) {
+                ([System.Windows.Automation.ValuePattern]$value).SetValue($email)
+                Start-Sleep -Seconds 2
+                $elements = @(Get-AllElements)
+                $buttons = @(Select-ButtonsContainingText -Elements $elements -Labels @('Next'))
+                $result.secondaryExactCount = $buttons.Count
+                if ($buttons.Count -eq 1) {
+                    [object]$invoke = $null
+                    if ($buttons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                        $result.attempted = $true
+                        ([System.Windows.Automation.InvokePattern]$invoke).Invoke()
+                        $result.succeeded = $true
+                    }
+                }
+            }
+        }
+    } else {
+        $code = Read-PrivateValue
+        if ($code -notmatch '^\d{6}$') { throw 'Owned confirmation code shape mismatch' }
+        $promptMatches = @($elements | Where-Object { $_.Current.Name -match '(?i)code|verification|confirm' })
+        $edits = @($elements | Where-Object {
+            $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and
+            $_.Current.Name -ne 'Work email' -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
+        })
+        $result.exactCount = $edits.Count
+        $result.secondaryExactCount = $promptMatches.Count
+        if ($promptMatches.Count -gt 0 -and ($edits.Count -eq 1 -or $edits.Count -eq 6)) {
+            $targets = if ($edits.Count -eq 1) { @($code) } else { @($code.ToCharArray() | ForEach-Object { [string]$_ }) }
+            for ($index = 0; $index -lt $edits.Count; $index++) {
+                [object]$value = $null
+                if (-not $edits[$index].TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value) -or
+                    ([System.Windows.Automation.ValuePattern]$value).Current.IsReadOnly) { throw 'Code input is not writable' }
+                ([System.Windows.Automation.ValuePattern]$value).SetValue($targets[$index])
+            }
+            $result.attempted = $true
+            Start-Sleep -Seconds 2
+            $elements = @(Get-AllElements)
+            $buttons = @(Select-ButtonsContainingText -Elements $elements -Labels @('Next', 'Continue', 'Verify'))
+            if ($buttons.Count -eq 1) {
+                [object]$invoke = $null
+                if ($buttons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                    ([System.Windows.Automation.InvokePattern]$invoke).Invoke()
+                }
+            } elseif ($buttons.Count -gt 1) {
+                throw 'Ambiguous code-submit control'
+            }
+            $result.succeeded = $true
+        }
     }
 } catch {
     $result.error = $_.Exception.ToString()
 }
 
 $result | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -Path $OutputPath
-
